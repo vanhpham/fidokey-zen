@@ -1,3 +1,27 @@
+# fidokey-zen
+
+Personal fork of [Pico FIDO](https://github.com/polhenarejos/pico-fido), built for one
+ESP32-S3 device. `pico-keys-sdk` is vendored in directly (no longer a git submodule) so
+this repo is self-contained.
+
+Customizations on top of upstream, in [pico-keys-sdk/src](pico-keys-sdk/src):
+
+- **[vault.c](pico-keys-sdk/src/vault.c)** — the Vaulted Passkeys enrollment CA is
+  swapped for a self-generated one, so backup/restore works without PicoKeyApp. See
+  [tools/README.md](tools/README.md) for the full setup and a GUI + CLI toolkit that
+  replaces PicoKeyApp's vault screen and credential manager.
+- **[led/led_neopixel.c](pico-keys-sdk/src/led/led_neopixel.c)** — smooth ease-in-out
+  breathing + a gentle hue drift instead of a hard on/off blink, for the ESP32-S3's
+  onboard NeoPixel.
+- **[usb/usb_descriptors.c](pico-keys-sdk/src/usb/usb_descriptors.c)** — WebUSB landing
+  page notification disabled (`iLandingPage = 0`).
+
+Build needs `-DENABLE_EDDSA=1` for the vault feature to work at all (see
+[tools/README.md](tools/README.md#why-a-custom-ca)); everything else builds the same as
+upstream. Everything below this point is the original upstream README.
+
+---
+
 # Pico FIDO
 This project transforms your Raspberry Pi Pico or ESP32 microcontroller into an integrated FIDO Passkey, functioning like a standard USB Passkey for authentication.
 

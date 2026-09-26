@@ -1,0 +1,433 @@
+/*
+ * This file is part of the Pico Keys SDK distribution (https://github.com/polhenarejos/pico-keys-sdk).
+ * Copyright (c) 2022 Pol Henarejos.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, version 3.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#include "picokeys.h"
+#include "pico_time.h"
+#include "rest.h"
+#ifdef _WIN32
+#include <string.h>
+#define strcasecmp _stricmp
+#define strncasecmp _strnicmp
+#define strdup _strdup
+#else
+#include <strings.h>
+#endif
+#include "random.h"
+#include "crypto_utils.h"
+#include "serial.h"
+
+#include "mbedtls/ecdh.h"
+#include "mbedtls/ecp.h"
+#include "mbedtls/hkdf.h"
+#include "mbedtls/platform_util.h"
+
+#define REST_MAX_SESSIONS 4
+
+rest_background_job_t background_jobs[REST_MAX_BACKGROUND_JOBS] = {0};
+
+static rest_session_t rest_sessions[REST_MAX_SESSIONS] = {0};
+static int x25519_hkdf_derive_key32(const uint8_t sk[32], const uint8_t pk[32], const_byte_array_t salt, const_byte_array_t info, uint8_t out_key[32]);
+
+rest_session_t *rest_session_create(const rest_session_role_t role, rest_session_status_t status, const uint8_t public_key[32]) {
+    for (int i = 0; i < REST_MAX_SESSIONS; i++) {
+        if (rest_sessions[i].status == REST_SESSION_UNKNOWN || rest_sessions[i].status == REST_SESSION_EXPIRED || rest_sessions[i].status == REST_SESSION_TERMINATED) {
+            memset(&rest_sessions[i], 0, sizeof(rest_session_t));
+            rest_sessions[i].status = status;
+            rest_sessions[i].role = role;
+            if (public_key != NULL) {
+                memcpy(rest_sessions[i].public_key, public_key, sizeof(rest_sessions[i].public_key));
+            } else {
+                memset(rest_sessions[i].public_key, 0, sizeof(rest_sessions[i].public_key));
+            }
+            random_fill_buffer(BYTE_ARRAY(rest_sessions[i].id, sizeof(rest_sessions[i].id)));
+            rest_sessions[i].created_at = board_millis();
+            rest_sessions[i].last_activity_timestamp = rest_sessions[i].created_at;
+            byte_buffer_t encoded_id = BYTE_BUFFER(rest_sessions[i].id_str, sizeof(rest_sessions[i].id_str));
+            if (base64url_encode(&encoded_id, CONST_BYTE_ARRAY(rest_sessions[i].id, sizeof(rest_sessions[i].id))) != 0) {
+                memset(&rest_sessions[i], 0, sizeof(rest_session_t));
+                return NULL;
+            }
+            return &rest_sessions[i];
+        }
+    }
+    return NULL;
+}
+
+rest_session_t *rest_session_get(const_byte_array_t id) {
+    if (id.data == NULL || id.len != 16) {
+        return NULL;
+    }
+    for (int i = 0; i < REST_MAX_SESSIONS; i++) {
+        if (rest_sessions[i].status != REST_SESSION_UNKNOWN && rest_sessions[i].status != REST_SESSION_EXPIRED && rest_sessions[i].status != REST_SESSION_TERMINATED) {
+            if (memcmp(rest_sessions[i].id, id.data, sizeof(rest_sessions[i].id)) == 0) {
+                return &rest_sessions[i];
+            }
+        }
+    }
+    return NULL;
+}
+
+rest_session_t *rest_session_get_by_id_str(const char *id_str) {
+    if (id_str == NULL || strlen(id_str) != 22) {
+        return NULL;
+    }
+    for (int i = 0; i < REST_MAX_SESSIONS; i++) {
+        if (rest_sessions[i].status != REST_SESSION_UNKNOWN && rest_sessions[i].status != REST_SESSION_EXPIRED && rest_sessions[i].status != REST_SESSION_TERMINATED) {
+            if (strcmp((const char *)rest_sessions[i].id_str, id_str) == 0) {
+                return &rest_sessions[i];
+            }
+        }
+    }
+    return NULL;
+}
+
+int rest_session_terminate(const_byte_array_t id) {
+    rest_session_t *session = rest_session_get(id);
+    if (session == NULL) {
+        return -1;
+    }
+    session->status = REST_SESSION_TERMINATED;
+    return 0;
+}
+
+int rest_session_update_activity(const_byte_array_t id) {
+    rest_session_t *session = rest_session_get(id);
+    if (session == NULL) {
+        return -1;
+    }
+    session->last_activity_timestamp = board_millis();
+    return 0;
+}
+
+int rest_session_set_status(const_byte_array_t id, rest_session_status_t status) {
+    rest_session_t *session = rest_session_get(id);
+    if (session == NULL) {
+        return -1;
+    }
+    session->status = status;
+    return 0;
+}
+
+int rest_session_set_role(const_byte_array_t id, rest_session_role_t role) {
+    rest_session_t *session = rest_session_get(id);
+    if (session == NULL) {
+        return -1;
+    }
+    session->role = role;
+    return 0;
+}
+
+int rest_session_cleanup_expired(time_t expiration_time) {
+    int count = 0;
+    time_t now = board_millis();
+    for (int i = 0; i < REST_MAX_SESSIONS; i++) {
+        if (rest_sessions[i].status != REST_SESSION_UNKNOWN && rest_sessions[i].status != REST_SESSION_EXPIRED && rest_sessions[i].status != REST_SESSION_TERMINATED) {
+            if (now - rest_sessions[i].last_activity_timestamp > expiration_time) {
+                rest_sessions[i].status = REST_SESSION_EXPIRED;
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+void rest_session_clear_all(void) {
+    memset(rest_sessions, 0, sizeof(rest_sessions));
+}
+
+#if DEBUG_APDU
+void rest_debug_dump_payload(const char *tag, const_byte_array_t buffer) {
+    size_t i;
+    if (buffer.data == NULL) {
+        printf("[rest] %s: <null>\n", tag);
+        return;
+    }
+
+    printf("[rest] %s (%lu bytes): \"", tag, (unsigned long)buffer.len);
+    for (i = 0; i < buffer.len; i++) {
+        unsigned char c = buffer.data[i];
+        if (c == '\r') {
+            printf("\\r");
+        }
+        else if (c == '\n') {
+            printf("\\n");
+        }
+        else if (c == '\t') {
+            printf("\\t");
+        }
+         else if (c >= 32 && c <= 126) {
+            putchar((int)c);
+        }
+         else {
+            printf("\\x%02X", c);
+        }
+    }
+    printf("\"\n");
+    if (tag[2] == 's') {
+        printf("\n");
+    }
+}
+#endif
+
+int rest_execute_route_handler(const rest_request_t *request, rest_route_handler_t handler, rest_response_t *response) {
+    if (request == NULL || handler == NULL || response == NULL) {
+        return -1;
+    }
+
+    memset(response, 0, sizeof(*response));
+    response->status_code = 200;
+    response->content_type = "application/json";
+    response->body = (char *)"{\"ok\":true}";
+    response->json = cJSON_CreateObject();
+    if (response->json == NULL) {
+        return -1;
+    }
+
+    if (handler(request, response) != 0) {
+        cJSON_Delete(response->json);
+        response->json = NULL;
+        return -1;
+    }
+    if (response->content_type == NULL || response->body == NULL) {
+        cJSON_Delete(response->json);
+        response->json = NULL;
+        return -1;
+    }
+    bool is_json_response = (response->content_type != NULL && strcmp(response->content_type, "application/json") == 0);
+    if (is_json_response && (response->status_code == 0 || response->status_code == 200 || response->status_code == 201 || response->status_code == 204)) {
+        char *body = cJSON_PrintUnformatted(response->json);
+        cJSON_Delete(response->json);
+        response->json = NULL;
+        if (body == NULL) {
+            return -1;
+        }
+        if (memcmp(body, "{}", 2) == 0) {
+            free(body);
+            body = strdup("");
+            if (body == NULL) {
+                return -1;
+            }
+        }
+        response->body = body;
+        response->body_len = 0;
+    }
+    if (response->json != NULL) {
+        cJSON_Delete(response->json);
+        response->json = NULL;
+    }
+
+    response->status_code = (response->status_code == 0) ? 200 : response->status_code;
+    response->body_len = (response->body_len == 0) ? strlen(response->body) : response->body_len;
+    return 0;
+}
+
+int rest_response_set_error(rest_response_t *response, int status_code, const char *message) {
+    char json_template[256];
+    int json_len;
+    if (response == NULL) {
+        return -1;
+    }
+    json_len = snprintf(json_template, sizeof(json_template), "{\"error\":\"%s\"}", message);
+    if (json_len <= 0 || (size_t)json_len >= sizeof(json_template)) {
+        return -1;
+    }
+    response->status_code = (uint16_t)status_code;
+    response->content_type = "application/json";
+    response->body = strdup(json_template);
+    if (response->body == NULL) {
+        return -1;
+    }
+    response->body_len = (size_t)json_len;
+    return 0;
+}
+
+const char *rest_status_text_from_code(uint16_t code) {
+    switch (code) {
+        case 200:
+            return "OK";
+        case 400:
+            return "Bad Request";
+        case 404:
+            return "Not Found";
+        case 405:
+            return "Method Not Allowed";
+        case 413:
+            return "Payload Too Large";
+        case 415:
+            return "Unsupported Media Type";
+        case 500:
+            return "Internal Server Error";
+        case 503:
+            return "Service Unavailable";
+        default:
+            return "OK";
+    }
+}
+
+const char *rest_method_to_string(rest_http_method_t method) {
+    switch (method) {
+        case REST_HTTP_GET:
+            return "GET";
+        case REST_HTTP_POST:
+            return "POST";
+        case REST_HTTP_PUT:
+            return "PUT";
+        case REST_HTTP_DELETE:
+            return "DELETE";
+        case REST_HTTP_UNKNOWN:
+        case REST_HTTP_GET_POST:
+        case REST_HTTP_GET_PUT:
+        case REST_HTTP_GET_DELETE:
+        case REST_HTTP_POST_PUT:
+        case REST_HTTP_POST_DELETE:
+        case REST_HTTP_PUT_DELETE:
+        case REST_HTTP_GET_POST_PUT:
+        case REST_HTTP_GET_POST_DELETE:
+        case REST_HTTP_GET_PUT_DELETE:
+        case REST_HTTP_POST_PUT_DELETE:
+        case REST_HTTP_GET_POST_PUT_DELETE:
+        default:
+            return "UNKNOWN";
+    }
+}
+
+bool rest_supported_content_type(const char *content_type) {
+    if (content_type == NULL) {
+        return false;
+    }
+    const char *supported_types[] = {
+        "application/json",
+        "application/x-pem-file"
+    };
+    for (size_t i = 0; i < sizeof(supported_types) / sizeof(supported_types[0]); i++) {
+        if (strncasecmp(content_type, supported_types[i], strlen(supported_types[i])) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+#ifndef _MSC_VER
+WEAK const rest_route_t *rest_get_routes(size_t *count) {
+    if (count != NULL) {
+        *count = 0;
+    }
+    return NULL;
+}
+#endif
+
+static int x25519_hkdf_derive_key32(const uint8_t sk[32], const uint8_t pk[32], const_byte_array_t salt, const_byte_array_t info, uint8_t out_key[32]) {
+    int ret = -1;
+    size_t shared_len = 0;
+    uint8_t shared[32] = {0};
+
+    mbedtls_ecdh_context ecdh;
+    mbedtls_ecp_keypair ours, theirs;
+    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+
+    mbedtls_ecdh_init(&ecdh);
+    mbedtls_ecp_keypair_init(&ours);
+    mbedtls_ecp_keypair_init(&theirs);
+
+    if (md == NULL) {
+        ret = MBEDTLS_ERR_MD_BAD_INPUT_DATA;
+        goto cleanup;
+    }
+
+    MBEDTLS_MPI_CHK(mbedtls_ecp_group_load(&ours.grp, MBEDTLS_ECP_DP_CURVE25519));
+    MBEDTLS_MPI_CHK(mbedtls_ecp_group_load(&theirs.grp, MBEDTLS_ECP_DP_CURVE25519));
+
+    MBEDTLS_MPI_CHK(mbedtls_ecp_read_key(MBEDTLS_ECP_DP_CURVE25519, &ours, sk, 32));
+
+    MBEDTLS_MPI_CHK(mbedtls_ecp_point_read_binary(&theirs.grp, &theirs.Q, pk, 32));
+
+    MBEDTLS_MPI_CHK(mbedtls_ecdh_setup(&ecdh, MBEDTLS_ECP_DP_CURVE25519));
+    MBEDTLS_MPI_CHK(mbedtls_ecdh_get_params(&ecdh, &ours, MBEDTLS_ECDH_OURS));
+    MBEDTLS_MPI_CHK(mbedtls_ecdh_get_params(&ecdh, &theirs, MBEDTLS_ECDH_THEIRS));
+
+    MBEDTLS_MPI_CHK(mbedtls_ecdh_calc_secret(&ecdh, &shared_len, shared, sizeof(shared), random_fill_iterator, NULL));
+
+    if (shared_len != 32) {
+        ret = MBEDTLS_ERR_ECP_BAD_INPUT_DATA;
+        goto cleanup;
+    }
+
+    ret = mbedtls_hkdf(md, salt.data, salt.len, shared, shared_len, info.data, info.len, out_key, 32);
+
+cleanup:
+    mbedtls_platform_zeroize(shared, sizeof(shared));
+    mbedtls_ecdh_free(&ecdh);
+    mbedtls_ecp_keypair_free(&ours);
+    mbedtls_ecp_keypair_free(&theirs);
+    return ret;
+}
+
+int rest_session_derive_key(const rest_session_t *session, uint8_t sk[32]) {
+    uint8_t kver[32];
+    const mbedtls_md_info_t *md_info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    derive_kver(CONST_BYTE_ARRAY(session->id, sizeof(session->id)), kver);
+    mbedtls_hkdf(md_info, pico_serial_hash, sizeof(pico_serial_hash), kver, 32, (const uint8_t *)"REST/SESSION", 12, sk, 32);
+    mbedtls_platform_zeroize(kver, sizeof(kver));
+    return PICOKEYS_OK;
+}
+
+int rest_session_derive_shared(const rest_session_t *session, uint8_t derived_key[32]) {
+    uint8_t sk[32];
+    rest_session_derive_key(session, sk);
+    int ret = x25519_hkdf_derive_key32(sk, session->public_key, CONST_BYTE_ARRAY(session->id, sizeof(session->id)), CONST_BYTE_ARRAY((const uint8_t *)"REST/SESSION/DERIVE", 19), derived_key);
+    mbedtls_platform_zeroize(sk, sizeof(sk));
+    if (ret != 0) {
+        return -1;
+    }
+    return PICOKEYS_OK;
+}
+
+int rest_background_job_push(rest_route_handler_t handler) {
+    if (handler == NULL) {
+        return -1;
+    }
+    for (int i = 0; i < REST_MAX_BACKGROUND_JOBS; i++) {
+        if (background_jobs[i].handler == NULL) {
+            background_jobs[i].handler = handler;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+rest_route_handler_t rest_background_job_pop(void) {
+    for (int i = 0; i < REST_MAX_BACKGROUND_JOBS; i++) {
+        if (background_jobs[i].handler != NULL) {
+            rest_route_handler_t handler = background_jobs[i].handler;
+            background_jobs[i].handler = NULL;
+            return handler;
+        }
+    }
+    return NULL;
+}
+
+rest_query_t *rest_query_get(const rest_request_t *request, const char *key) {
+    if (request == NULL || key == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < request->query_count; i++) {
+        if (request->query[i].key != NULL && strcmp(request->query[i].key, key) == 0) {
+            return &request->query[i];
+        }
+    }
+    return NULL;
+}

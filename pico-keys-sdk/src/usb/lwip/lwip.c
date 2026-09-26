@@ -1,0 +1,299 @@
+/*
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2020 Peter Lawrence
+ *
+ * influenced by lrndis https://github.com/fetisov/lrndis
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ *
+ */
+
+/*
+this appears as either a RNDIS or CDC-ECM USB virtual network adapter; the OS picks its preference
+
+RNDIS should be valid on Linux and Windows hosts, and CDC-ECM should be valid on Linux and macOS hosts
+
+The MCU appears to the host as IP address 192.168.7.1, and provides a DHCP server, DNS server, and web server.
+*/
+/*
+Some smartphones *may* work with this implementation as well, but likely have limited (broken) drivers,
+and likely their manufacturer has not tested such functionality. Some code workarounds could be tried:
+
+The smartphone may only have an ECM driver, but refuse to automatically pick ECM (unlike the OSes above);
+try modifying ./examples/devices/net_lwip_webserver/usb_descriptors.c so that CONFIG_ID_ECM is default.
+
+The smartphone may be artificially picky about which Ethernet MAC address to recognize; if this happens,
+try changing the first byte of tud_network_mac_address[] below from 0x02 to 0x00 (clearing bit 1).
+*/
+
+#include "picokeys.h"
+#if defined(PICO_PLATFORM)
+#include "dhserver.h"
+#include "dnserver.h"
+#include "lwip/init.h"
+#include "lwip/timeouts.h"
+#include "bsp/board.h"
+#elif defined(ESP_PLATFORM)
+#include "apps/dhcpserver/dhcpserver.h"
+#include "netif/ethernet.h"
+#include "lwip/etharp.h"
+#include "lwip/netif.h"
+#include "lwip/pbuf.h"
+#endif
+#include "rest_server.h"
+#include "tusb.h"
+
+void service_traffic(void);
+int lwip_itf_init(void);
+
+#define INIT_IP4(a, b, c, d) \
+  { PP_HTONL(LWIP_MAKEU32(a, b, c, d)) }
+
+/* lwip context */
+static struct netif netif_data;
+
+/* shared between tud_network_recv_cb() and service_traffic() */
+static struct pbuf *received_frame;
+
+/* this is used by this code, ./class/net/net_driver.c, and usb_descriptors.c */
+/* ideally speaking, this should be generated from the hardware's unique ID (if available) */
+/* it is suggested that the first byte is 0x02 to indicate a link-local address */
+uint8_t tud_network_mac_address[6] = {0x02, 0x02, 0x84, 0x6A, 0x96, 0x00};
+
+/* network parameters of this MCU */
+static const ip4_addr_t ipaddr = INIT_IP4(192, 168, 7, 1);
+static const ip4_addr_t netmask = INIT_IP4(255, 255, 255, 0);
+static const ip4_addr_t gateway = INIT_IP4(0, 0, 0, 0);
+
+#if !defined(ESP_PLATFORM)
+
+/* database IP addresses that can be offered to the host; this must be in RAM to store assigned MAC addresses */
+static dhcp_entry_t entries[] = {
+    /* mac ip address               lease time */
+    {{0}, INIT_IP4(192, 168, 7, 2), 24 * 60 * 60},
+    {{0}, INIT_IP4(192, 168, 7, 3), 24 * 60 * 60},
+    {{0}, INIT_IP4(192, 168, 7, 4), 24 * 60 * 60},
+};
+
+static const dhcp_config_t dhcp_config = {
+    .router = INIT_IP4(0, 0, 0, 0),  /* router address (if any) */
+    .port = 67,                      /* listen port */
+    .dns = ipaddr, /* dns server (if any) */
+    "usb",                           /* dns suffix */
+    TU_ARRAY_SIZE(entries),          /* num entry */
+    entries                          /* entries */
+};
+
+/* handle any DNS requests from dns-server */
+static bool dns_query_proc(const char *name, ip4_addr_t *addr) {
+  if (0 == strcmp(name, "tiny.usb")) {
+    *addr = ipaddr;
+    return true;
+  }
+  return false;
+}
+#endif
+
+#if defined(ESP_PLATFORM)
+static dhcps_t *dhcps = NULL;
+
+static void dhcps_lease_cb(void *cb_arg, u8_t client_ip[4], u8_t client_mac[6]) {
+  (void) cb_arg;
+  (void) client_ip;
+  (void) client_mac;
+}
+
+#endif
+
+static err_t linkoutput_fn(struct netif *netif, struct pbuf *p) {
+  (void) netif;
+
+  for (;;) {
+    if (!tud_ready()) {
+      return ERR_USE;
+    }
+
+    if (tud_network_can_xmit(p->tot_len)) {
+      tud_network_xmit(p, 0);
+      return ERR_OK;
+    }
+#if defined(ESP_PLATFORM)
+    vTaskDelay(pdMS_TO_TICKS(1));
+#else
+    tud_task();
+#endif
+  }
+}
+
+static err_t ip4_output_fn(struct netif *netif, struct pbuf *p, const ip4_addr_t *addr) {
+  return etharp_output(netif, p, addr);
+}
+
+static err_t netif_init_cb(struct netif *netif) {
+  LWIP_ASSERT("netif != NULL", (netif != NULL));
+  netif->mtu = CFG_TUD_NET_MTU;
+  netif->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP | NETIF_FLAG_LINK_UP | NETIF_FLAG_UP;
+  netif->state = NULL;
+  netif->name[0] = 'E';
+  netif->name[1] = 'X';
+  netif->linkoutput = linkoutput_fn;
+  netif->output = ip4_output_fn;
+  return ERR_OK;
+}
+
+static void init_lwip(void) {
+  struct netif *netif = &netif_data;
+
+  netif->hwaddr_len = sizeof(tud_network_mac_address);
+  memcpy(netif->hwaddr, tud_network_mac_address, sizeof(tud_network_mac_address));
+  netif->hwaddr[5] ^= 0x01;
+
+#ifdef PICO_PLATFORM
+  lwip_init();
+#endif
+  netif = netif_add(netif, &ipaddr, &netmask, &gateway, NULL, netif_init_cb, ethernet_input);
+  netif_set_link_up(netif);
+  netif_set_up(netif);
+  netif_set_default(netif);
+}
+
+bool tud_network_recv_cb(const uint8_t *src, uint16_t size) {
+  /* this shouldn't happen, but if we get another packet before
+  parsing the previous, we must signal our inability to accept it */
+  if (received_frame) return false;
+
+  if (size) {
+    struct pbuf *p = pbuf_alloc(PBUF_RAW, size, PBUF_POOL);
+
+    if (p) {
+      if (pbuf_take(p, src, size) != ERR_OK) {
+        pbuf_free(p);
+        return false;
+      }
+
+      /* store away the pointer for service_traffic() to later handle */
+      received_frame = p;
+    }
+  }
+
+  return true;
+}
+
+uint16_t tud_network_xmit_cb(uint8_t *dst, void *ref, uint16_t arg) {
+  struct pbuf *p = (struct pbuf *) ref;
+
+  (void) arg; /* unused for this example */
+
+  return pbuf_copy_partial(p, dst, p->tot_len, 0);
+}
+
+void service_traffic(void) {
+  /* handle any packet received by tud_network_recv_cb() */
+  if (received_frame) {
+    // Surrender ownership of our pbuf unless there was an error
+    // Only call pbuf_free if not Ok else it will panic with "pbuf_free: p->ref > 0"
+    // or steal it from whatever took ownership of it with undefined consequences.
+    // See: https://savannah.nongnu.org/patch/index.php?10121
+    if (ethernet_input(received_frame, &netif_data)!=ERR_OK) {
+        pbuf_free(received_frame);
+    }
+    received_frame = NULL;
+    tud_network_recv_renew();
+  }
+#if !defined(ESP_PLATFORM)
+  sys_check_timeouts();
+#endif
+}
+
+void tud_network_init_cb(void) {
+  /* if the network is re-initializing and we have a leftover packet, we must do a cleanup */
+  if (received_frame) {
+    pbuf_free(received_frame);
+    received_frame = NULL;
+  }
+  /* Arm first receive buffer, otherwise host traffic (DHCP included) never enters lwIP. */
+  tud_network_recv_renew();
+}
+
+int lwip_itf_init(void) {
+  const uint32_t init_timeout_ms = 5000;
+  uint32_t start_ms = board_millis();
+  init_lwip();
+
+  while (!netif_is_up(&netif_data)) {
+    if (board_millis() - start_ms >= init_timeout_ms) {
+      return -1;
+    }
+#if defined(ESP_PLATFORM)
+    vTaskDelay(pdMS_TO_TICKS(1));
+#else
+    sleep_ms(1);
+#endif
+  }
+
+#if !defined(ESP_PLATFORM)
+  start_ms = board_millis();
+  while (dhserv_init(&dhcp_config) != ERR_OK) {
+    if (board_millis() - start_ms >= init_timeout_ms) {
+      return -1;
+    }
+    sleep_ms(1);
+  }
+
+  start_ms = board_millis();
+  while (dnserv_init(IP_ADDR_ANY, 53, dns_query_proc) != ERR_OK) {
+    if (board_millis() - start_ms >= init_timeout_ms) {
+      return -1;
+    }
+    sleep_ms(1);
+  }
+#else
+  if (dhcps == NULL) {
+    dhcps = dhcps_new();
+  }
+  if (dhcps) {
+    (void) dhcps_set_new_lease_cb(dhcps, dhcps_lease_cb, NULL);
+    ip_addr_t dns_server;
+    ip_addr_copy_from_ip4(dns_server, ipaddr);
+    (void) dhcps_dns_setserver(dhcps, &dns_server);
+    start_ms = board_millis();
+    while (dhcps_start(dhcps, &netif_data, ipaddr) != ERR_OK) {
+      if (board_millis() - start_ms >= init_timeout_ms) {
+        return -1;
+      }
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+  }
+#endif
+
+  start_ms = board_millis();
+  while (rest_server_init(REST_CONN_ALL) != ERR_OK) {
+    if (board_millis() - start_ms >= init_timeout_ms) {
+      return -1;
+    }
+#if defined(ESP_PLATFORM)
+    vTaskDelay(pdMS_TO_TICKS(1));
+#else
+    sleep_ms(1);
+#endif
+  }
+
+  return 0;
+}
