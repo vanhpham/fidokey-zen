@@ -157,8 +157,18 @@ from this vault can ever be decrypted again, even on the original device.
 python picofido_gui.py
 ```
 
-One window, three tabs:
+One window, six tabs — covers everything PicoKeyApp's device screens do, all
+implemented directly against the open protocols in this repo (rescue CCID
+applet + standard CTAP2), nothing closed-source involved:
 
+- **Thông tin (Device Info)** — MCU/product/firmware version/serial (rescue
+  applet SELECT), flash usage, Secure Boot status.
+- **Cấu hình thiết bị (Device Settings)** — full `phy_data` editor over the
+  rescue CCID applet: USB product string, VID/PID, LED brightness/GPIO/driver
+  /color order, which USB interfaces are enabled (CCID/WebCCID/HID/keyboard
+  /network), which crypto curves are enabled, and the option flags (WCID,
+  smooth dimming, steady LED, skip-reset-on-power-loss). Read-modify-write,
+  same as `picophy.py` but as a form; writing needs a physical button press.
 - **Credentials** — list every resident credential (RP / user / credential
   id), export one to a `.pkv1` file, or delete one.
 - **Sao lưu / Khôi phục (Backup / Restore)** — one button exports *every*
@@ -169,8 +179,14 @@ One window, three tabs:
   **recover an existing `Kvault`** from a saved envelope instead of
   generating a new one, which is what you need when moving to a
   replacement board (see below).
+- **PIN & Nâng cao (PIN & Advanced)** — set/change the CTAP2 PIN; standard
+  `authenticatorConfig` toggles (Enterprise Attestation, Always-UV,
+  minimum PIN length); factory reset (`authenticatorReset` — only works in
+  the first 10 seconds after power-up, and needs a button press, per
+  `src/fido/cbor_reset.c`).
 
-Or the CLI directly: `picovault.py {status,serial,enroll,export,import,unenroll,list-credentials}`.
+Or the CLI directly: `picovault.py {status,serial,enroll,export,import,unenroll,list-credentials}`
+and `picophy.py {list,read,set}`.
 
 ## Recovering onto a replacement board
 

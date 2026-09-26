@@ -12,6 +12,7 @@ Run:
 import datetime
 import json
 import os
+import struct
 import tempfile
 import tkinter as tk
 import zipfile
@@ -20,12 +21,18 @@ from tkinter import ttk, filedialog, messagebox
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import x448
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
-from fido2.ctap2 import Ctap2, CredentialManagement
+from fido2.ctap2 import Ctap2, CredentialManagement, Config as Ctap2Config
 from fido2.ctap2.pin import ClientPin, PinProtocolV2
 from fido2.ctap import CtapError
 
 import vault_crypto
 import picovault
+import picophy
+from picovault import (
+    vendor_call,
+    VAULT_STATUS, VAULT_ENROLL_BEGIN, VAULT_ENROLL_FINISH, VAULT_EXPORT, VAULT_IMPORT, VAULT_UNENROLL,
+    REQUIRED_PERMISSIONS,
+)
 
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".picofido_gui.json")
 
@@ -44,11 +51,6 @@ def save_config(cfg):
             json.dump(cfg, f, indent=2)
     except Exception:
         pass
-from picovault import (
-    vendor_call,
-    VAULT_STATUS, VAULT_ENROLL_BEGIN, VAULT_ENROLL_FINISH, VAULT_EXPORT, VAULT_IMPORT, VAULT_UNENROLL,
-    REQUIRED_PERMISSIONS,
-)
 
 
 # ---------------------------------------------------------------- helpers
@@ -75,21 +77,26 @@ def pin_token(dev, pin):
     return protocol, token
 
 
+def rescue_connect():
+    """picophy.connect() calls sys.exit() on failure; convert like get_device()."""
+    try:
+        return picophy.connect()
+    except SystemExit as e:
+        raise RuntimeError(str(e)) from None
+
+
+def read_device_select():
+    """SELECTs the rescue applet and returns (mcu, product, ver_major, ver_minor, serial_hex)."""
+    conn = rescue_connect()
+    data = picophy.select_rescue(conn)
+    if len(data) < 12:
+        raise RuntimeError(f"unexpected SELECT response: {data.hex()}")
+    return conn, data[0], data[1], data[2], data[3], data[4:12].hex().upper()
+
+
 def read_device_serial():
-    """Reads the hardware serial over the rescue CCID applet (pyscard)."""
-    from smartcard.System import readers
-    rs = readers()
-    if not rs:
-        raise RuntimeError("No PC/SC reader found for the rescue CCID interface.")
-    reader = next((r for r in rs if "pico" in str(r).lower() or "fido" in str(r).lower()), rs[0])
-    conn = reader.createConnection()
-    conn.connect()
-    aid = [0xA0, 0x58, 0x3F, 0xC1, 0x9B, 0x7E, 0x4F, 0x21]
-    data, sw1, sw2 = conn.transmit([0x00, 0xA4, 0x04, 0x00, len(aid)] + aid)
-    if (sw1, sw2) != (0x90, 0x00):
-        raise RuntimeError(f"SELECT failed: {sw1:02X}{sw2:02X}")
-    data = bytes(data)
-    return data[4:12].hex().upper()
+    _conn, _mcu, _product, _vmaj, _vmin, serial = read_device_select()
+    return serial
 
 
 # ---------------------------------------------------------------- app
@@ -115,16 +122,25 @@ class App(tk.Tk):
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=8, pady=8)
 
+        self.tab_info = ttk.Frame(notebook)
+        self.tab_device = ttk.Frame(notebook)
         self.tab_creds = ttk.Frame(notebook)
         self.tab_backup = ttk.Frame(notebook)
         self.tab_enroll = ttk.Frame(notebook)
+        self.tab_pin = ttk.Frame(notebook)
+        notebook.add(self.tab_info, text="Thông tin")
+        notebook.add(self.tab_device, text="Cấu hình thiết bị")
         notebook.add(self.tab_creds, text="Credentials")
         notebook.add(self.tab_backup, text="Sao lưu / Khôi phục")
         notebook.add(self.tab_enroll, text="Enroll")
+        notebook.add(self.tab_pin, text="PIN & Nâng cao")
 
+        self._build_info_tab()
+        self._build_device_tab()
         self._build_creds_tab()
         self._build_backup_tab()
         self._build_enroll_tab()
+        self._build_pin_tab()
 
         ttk.Label(self, text="Log:").pack(anchor="w", padx=8)
         self.log_text = tk.Text(self, height=8, state="disabled")
@@ -165,6 +181,370 @@ class App(tk.Tk):
             messagebox.showinfo("Serial", f"Serial: {serial}\n(dùng cho vault_ca.py make-leaf --serial ...)")
         except Exception as e:
             messagebox.showerror("Lỗi", str(e))
+
+    # ---- Device Info tab -----------------------------------------------
+
+    def _build_info_tab(self):
+        frame = ttk.Frame(self.tab_info, padding=10)
+        frame.pack(fill="both", expand=True)
+        ttk.Button(frame, text="Làm mới thông tin", command=self.on_refresh_info).pack(anchor="w")
+        self.info_text = tk.Text(frame, height=20, state="disabled", font=("Consolas", 10))
+        self.info_text.pack(fill="both", expand=True, pady=(8, 0))
+
+    def _info_println(self, line=""):
+        self.info_text.insert("end", line + "\n")
+
+    def on_refresh_info(self):
+        self.info_text.configure(state="normal")
+        self.info_text.delete("1.0", "end")
+        try:
+            conn, mcu, product, vmaj, vmin, serial = read_device_select()
+            self._info_println("=== Rescue applet (CCID) ===")
+            self._info_println(f"MCU code       : {mcu}  (1=RP2350 2=ESP32-S3 3=emulation 4=ESP32-S2)")
+            self._info_println(f"Product code   : {product}")
+            self._info_println(f"Firmware ver   : {vmaj}.{vmin}")
+            self._info_println(f"Serial         : {serial}")
+
+            try:
+                flash = picophy.transmit(conn, [0x80, 0x1E, 0x02, 0x00, 0x00])
+                free_, used, total, nfiles = struct.unpack(">IIII", flash[:16])
+                self._info_println()
+                self._info_println("=== Flash ===")
+                self._info_println(f"Used / total   : {used} / {total} bytes ({100*used//max(total,1)}%)")
+                self._info_println(f"Free           : {free_} bytes")
+                self._info_println(f"Files          : {nfiles}")
+            except Exception as e:
+                self._info_println(f"(flash info unavailable: {e})")
+
+            try:
+                sb = picophy.transmit(conn, [0x80, 0x1E, 0x03, 0x00, 0x00])
+                self._info_println()
+                self._info_println("=== Secure Boot (RP2350/ESP32-S3) ===")
+                self._info_println(f"Enabled        : {bool(sb[0])}")
+                self._info_println(f"Locked         : {bool(sb[1])}")
+                self._info_println(f"Boot key index : {sb[2]}")
+            except Exception as e:
+                self._info_println(f"(secure boot status unavailable: {e})")
+        except Exception as e:
+            self._info_println(f"LỖI: {e}")
+        finally:
+            self.info_text.configure(state="disabled")
+
+    # ---- Device Settings tab (phy_data, over rescue CCID) ---------------
+
+    def _build_device_tab(self):
+        outer = ttk.Frame(self.tab_device, padding=10)
+        outer.pack(fill="both", expand=True)
+
+        bar = ttk.Frame(outer)
+        bar.pack(fill="x", pady=(0, 8))
+        ttk.Button(bar, text="Đọc từ thiết bị", command=self.on_phy_read).pack(side="left")
+        ttk.Button(bar, text="Ghi vào thiết bị (cần giữ nút)", command=self.on_phy_write).pack(side="left", padx=8)
+        ttk.Label(bar, foreground="#a00",
+                  text="Ghi cần bấm nút vật lý trên khoá trong vài giây khi được nhắc.").pack(side="left")
+
+        grid = ttk.Frame(outer)
+        grid.pack(fill="x")
+
+        def entry_row(parent, label, width=30):
+            row = ttk.Frame(parent)
+            row.pack(fill="x", pady=2)
+            ttk.Label(row, text=label, width=22).pack(side="left")
+            var = tk.StringVar()
+            ttk.Entry(row, textvariable=var, width=width).pack(side="left")
+            return var
+
+        left = ttk.LabelFrame(grid, text="Cơ bản", padding=8)
+        left.pack(side="left", fill="y", padx=(0, 8))
+        self.phy_product_var = entry_row(left, "Tên USB (product):")
+        self.phy_vidpid_var = entry_row(left, "VID:PID (hex):")
+        self.phy_brightness_var = entry_row(left, "Độ sáng LED (0-15):", width=6)
+        self.phy_gpio_var = entry_row(left, "LED GPIO:", width=6)
+
+        row = ttk.Frame(left)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text="LED driver:", width=22).pack(side="left")
+        self.phy_driver_var = tk.StringVar()
+        driver_names = list(picophy.PHY_LED_DRIVER_NAMES.values())
+        ttk.Combobox(row, textvariable=self.phy_driver_var, values=driver_names, width=20, state="readonly").pack(side="left")
+
+        row = ttk.Frame(left)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text="Thứ tự màu LED:", width=22).pack(side="left")
+        self.phy_order_var = tk.StringVar()
+        ttk.Combobox(row, textvariable=self.phy_order_var, values=list(picophy.PHY_LED_ORDER_NAMES.values()),
+                     width=20, state="readonly").pack(side="left")
+
+        mid = ttk.LabelFrame(grid, text="Tuỳ chọn (opts)", padding=8)
+        mid.pack(side="left", fill="y", padx=(0, 8))
+        self.phy_opt_wcid = tk.BooleanVar()
+        self.phy_opt_dimm = tk.BooleanVar()
+        self.phy_opt_nopower = tk.BooleanVar()
+        self.phy_opt_steady = tk.BooleanVar()
+        ttk.Checkbutton(mid, text="WCID", variable=self.phy_opt_wcid).pack(anchor="w")
+        ttk.Checkbutton(mid, text="LED dimming mượt", variable=self.phy_opt_dimm).pack(anchor="w")
+        ttk.Checkbutton(mid, text="Không reset khi mất điện", variable=self.phy_opt_nopower).pack(anchor="w")
+        ttk.Checkbutton(mid, text="LED sáng liên tục (steady)", variable=self.phy_opt_steady).pack(anchor="w")
+
+        right = ttk.LabelFrame(grid, text="Interface USB bật", padding=8)
+        right.pack(side="left", fill="y")
+        self.phy_itf_vars = {}
+        for name, bit in [("CCID", picophy.PHY_USB_ITF_CCID), ("WebCCID", picophy.PHY_USB_ITF_WCID),
+                            ("HID (FIDO)", picophy.PHY_USB_ITF_HID), ("HID Keyboard (OTP)", picophy.PHY_USB_ITF_KB),
+                            ("Network (LWIP)", picophy.PHY_USB_ITF_LWIP)]:
+            var = tk.BooleanVar()
+            ttk.Checkbutton(right, text=name, variable=var).pack(anchor="w")
+            self.phy_itf_vars[bit] = var
+
+        curves_frame = ttk.LabelFrame(outer, text="Đường cong mật mã được bật (enabled curves)", padding=8)
+        curves_frame.pack(fill="x", pady=(8, 0))
+        self.phy_curve_vars = {}
+        curve_names = [("SECP256R1", picophy.PHY_CURVE_SECP256R1), ("SECP384R1", picophy.PHY_CURVE_SECP384R1),
+                       ("SECP521R1", picophy.PHY_CURVE_SECP521R1), ("SECP256K1", picophy.PHY_CURVE_SECP256K1),
+                       ("BP256R1", picophy.PHY_CURVE_BP256R1), ("BP384R1", picophy.PHY_CURVE_BP384R1),
+                       ("BP512R1", picophy.PHY_CURVE_BP512R1), ("ED25519", picophy.PHY_CURVE_ED25519),
+                       ("ED448", picophy.PHY_CURVE_ED448), ("CURVE25519", picophy.PHY_CURVE_CURVE25519),
+                       ("CURVE448", picophy.PHY_CURVE_CURVE448)]
+        for i, (name, bit) in enumerate(curve_names):
+            var = tk.BooleanVar()
+            ttk.Checkbutton(curves_frame, text=name, variable=var).grid(row=i // 6, column=i % 6, sticky="w", padx=4)
+            self.phy_curve_vars[bit] = var
+
+        ttk.Label(outer, foreground="#555",
+                  text="Đọc trước khi ghi. Ghi luôn thay thế TOÀN BỘ cấu hình bằng những gì đang hiện ở đây\n"
+                       "(không merge) -- nếu bỏ trống 1 ô, giá trị đó sẽ không được gửi và dùng mặc định firmware.")\
+            .pack(anchor="w", pady=(8, 0))
+
+    def on_phy_read(self):
+        try:
+            conn = rescue_connect()
+            picophy.select_rescue(conn)
+            blob = picophy.read_phy_raw(conn)
+            fields = picophy.parse_tlv(blob)
+
+            if picophy.PHY_VIDPID in fields and len(fields[picophy.PHY_VIDPID]) == 4:
+                vid, pid = struct.unpack(">HH", fields[picophy.PHY_VIDPID])
+                self.phy_vidpid_var.set(f"{vid:04x}:{pid:04x}")
+            if picophy.PHY_USB_PRODUCT in fields:
+                self.phy_product_var.set(fields[picophy.PHY_USB_PRODUCT].rstrip(b"\x00").decode(errors="replace"))
+            if picophy.PHY_LED_BTNESS in fields:
+                self.phy_brightness_var.set(str(fields[picophy.PHY_LED_BTNESS][0]))
+            if picophy.PHY_LED_GPIO in fields:
+                self.phy_gpio_var.set(str(fields[picophy.PHY_LED_GPIO][0]))
+            if picophy.PHY_LED_DRIVER in fields:
+                driver_id = fields[picophy.PHY_LED_DRIVER][0]
+                self.phy_driver_var.set(picophy.PHY_LED_DRIVER_NAMES.get(driver_id, ""))
+                if len(fields[picophy.PHY_LED_DRIVER]) > 1:
+                    self.phy_order_var.set(picophy.PHY_LED_ORDER_NAMES.get(fields[picophy.PHY_LED_DRIVER][1], ""))
+
+            opts = struct.unpack(">H", fields.get(picophy.PHY_OPTS, b"\x00\x00"))[0]
+            self.phy_opt_wcid.set(bool(opts & picophy.PHY_OPT_WCID))
+            self.phy_opt_dimm.set(bool(opts & picophy.PHY_OPT_DIMM))
+            self.phy_opt_nopower.set(bool(opts & picophy.PHY_OPT_DISABLE_POWER_RESET))
+            self.phy_opt_steady.set(bool(opts & picophy.PHY_OPT_LED_STEADY))
+
+            itf = fields.get(picophy.PHY_ENABLED_USB_ITF, bytes([picophy.PHY_USB_ITF_ALL]))[0]
+            for bit, var in self.phy_itf_vars.items():
+                var.set(bool(itf & bit))
+
+            curves = struct.unpack(">I", fields.get(picophy.PHY_ENABLED_CURVES, b"\x00\x00\x00\x00"))[0]
+            for bit, var in self.phy_curve_vars.items():
+                var.set(bool(curves & bit) if curves else False)
+
+            self._phy_last_fields = fields
+            self.log(f"Đã đọc cấu hình thiết bị ({len(blob)} bytes).")
+        except Exception as e:
+            messagebox.showerror("Lỗi", str(e))
+            self.log(f"phy read FAILED: {e}")
+
+    def on_phy_write(self):
+        try:
+            fields = dict(getattr(self, "_phy_last_fields", {}))
+
+            if self.phy_product_var.get():
+                fields[picophy.PHY_USB_PRODUCT] = self.phy_product_var.get().encode() + b"\x00"
+            if self.phy_vidpid_var.get():
+                vid_s, pid_s = self.phy_vidpid_var.get().split(":")
+                fields[picophy.PHY_VIDPID] = struct.pack(">HH", int(vid_s, 16), int(pid_s, 16))
+            if self.phy_brightness_var.get():
+                b = int(self.phy_brightness_var.get())
+                if not (0 <= b <= 15):
+                    raise ValueError("độ sáng phải trong khoảng 0-15")
+                fields[picophy.PHY_LED_BTNESS] = bytes([b])
+            if self.phy_gpio_var.get():
+                fields[picophy.PHY_LED_GPIO] = bytes([int(self.phy_gpio_var.get())])
+
+            name_to_driver = {v: k for k, v in picophy.PHY_LED_DRIVER_NAMES.items()}
+            name_to_order = {v: k for k, v in picophy.PHY_LED_ORDER_NAMES.items()}
+            if self.phy_driver_var.get() in name_to_driver:
+                driver_id = name_to_driver[self.phy_driver_var.get()]
+                order_id = name_to_order.get(self.phy_order_var.get(), 0)
+                fields[picophy.PHY_LED_DRIVER] = bytes([driver_id, order_id])
+
+            opts = 0
+            if self.phy_opt_wcid.get(): opts |= picophy.PHY_OPT_WCID
+            if self.phy_opt_dimm.get(): opts |= picophy.PHY_OPT_DIMM
+            if self.phy_opt_nopower.get(): opts |= picophy.PHY_OPT_DISABLE_POWER_RESET
+            if self.phy_opt_steady.get(): opts |= picophy.PHY_OPT_LED_STEADY
+            fields[picophy.PHY_OPTS] = struct.pack(">H", opts)
+
+            itf = 0
+            for bit, var in self.phy_itf_vars.items():
+                if var.get():
+                    itf |= bit
+            fields[picophy.PHY_ENABLED_USB_ITF] = bytes([itf])
+
+            curves = 0
+            for bit, var in self.phy_curve_vars.items():
+                if var.get():
+                    curves |= bit
+            if curves:
+                fields[picophy.PHY_ENABLED_CURVES] = struct.pack(">I", curves)
+
+            new_blob = picophy.build_tlv(fields)
+            conn = rescue_connect()
+            picophy.select_rescue(conn)
+            self.log("Đang ghi... bấm nút trên khoá NGAY BÂY GIỜ nếu được nhắc.")
+            picophy.write_phy_raw(conn, new_blob)
+            self.log("Đã ghi cấu hình. Rút cắm lại thiết bị để áp dụng tên USB/VID-PID mới.")
+            messagebox.showinfo("Xong", "Đã ghi cấu hình. Rút cắm lại thiết bị để áp dụng đầy đủ.")
+        except Exception as e:
+            messagebox.showerror("Lỗi", str(e))
+            self.log(f"phy write FAILED: {e}")
+
+    # ---- PIN & Advanced tab ---------------------------------------------
+
+    def _build_pin_tab(self):
+        frame = ttk.Frame(self.tab_pin, padding=10)
+        frame.pack(fill="both", expand=True)
+
+        pin_box = ttk.LabelFrame(frame, text="PIN", padding=10)
+        pin_box.pack(fill="x", pady=(0, 12))
+        row = ttk.Frame(pin_box)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text="PIN mới:", width=16).pack(side="left")
+        self.new_pin_var = tk.StringVar()
+        ttk.Entry(row, textvariable=self.new_pin_var, show="*", width=20).pack(side="left")
+        btns = ttk.Frame(pin_box)
+        btns.pack(fill="x", pady=(6, 0))
+        ttk.Button(btns, text="Đặt PIN lần đầu", command=self.on_set_pin).pack(side="left")
+        ttk.Button(btns, text="Đổi PIN (PIN ở khung trên -> PIN mới)", command=self.on_change_pin).pack(side="left", padx=8)
+        ttk.Label(pin_box, foreground="#555",
+                  text="'Đổi PIN' dùng PIN ở góc trên cùng cửa sổ làm PIN CŨ, và ô 'PIN mới' ở trên làm PIN MỚI.")\
+            .pack(anchor="w", pady=(4, 0))
+
+        cfg_box = ttk.LabelFrame(frame, text="Authenticator Config (CTAP2)", padding=10)
+        cfg_box.pack(fill="x", pady=(0, 12))
+        ttk.Button(cfg_box, text="Bật Enterprise Attestation", command=self.on_enable_enterprise).pack(anchor="w")
+        ttk.Button(cfg_box, text="Bật bắt buộc UV cho mọi thao tác (Always UV)",
+                   command=self.on_toggle_always_uv).pack(anchor="w", pady=4)
+        row = ttk.Frame(cfg_box)
+        row.pack(fill="x", pady=4)
+        ttk.Label(row, text="Độ dài PIN tối thiểu:", width=20).pack(side="left")
+        self.min_pin_length_var = tk.StringVar()
+        ttk.Entry(row, textvariable=self.min_pin_length_var, width=6).pack(side="left")
+        ttk.Button(row, text="Áp dụng", command=self.on_set_min_pin_length).pack(side="left", padx=8)
+
+        danger_box = ttk.LabelFrame(frame, text="Nguy hiểm", padding=10)
+        danger_box.pack(fill="x")
+        ttk.Button(danger_box, text="Reset toàn bộ thiết bị (factory reset)",
+                   command=self.on_factory_reset).pack(anchor="w")
+        ttk.Label(danger_box, foreground="#a00",
+                  text="Xoá TOÀN BỘ passkey, PIN, vault... trên thiết bị. Không thể hoàn tác.\n"
+                       "Chỉ thực hiện được trong 10 giây đầu sau khi cắm/reset thiết bị, và cần bấm nút\n"
+                       "xác nhận khi được yêu cầu (trừ khi đã tắt tuỳ chọn power-reset ở tab Cấu hình).\n"
+                       "Rút cắm lại thiết bị NGAY TRƯỚC KHI bấm nút này.")\
+            .pack(anchor="w", pady=(4, 0))
+
+    def on_set_pin(self):
+        new_pin = self.new_pin_var.get()
+        if not new_pin:
+            messagebox.showerror("Thiếu PIN", "Nhập PIN mới ở tab này trước.")
+            return
+        try:
+            dev = get_device()
+            ClientPin(Ctap2(dev), PinProtocolV2()).set_pin(new_pin)
+            self.log("Đã đặt PIN lần đầu.")
+            messagebox.showinfo("Xong", "Đã đặt PIN.")
+        except Exception as e:
+            messagebox.showerror("Lỗi", str(e))
+            self.log(f"set_pin FAILED: {e}")
+
+    def on_change_pin(self):
+        old_pin = self.pin()
+        new_pin = self.new_pin_var.get()
+        if not old_pin or not new_pin:
+            return
+        try:
+            dev = get_device()
+            ClientPin(Ctap2(dev), PinProtocolV2()).change_pin(old_pin, new_pin)
+            self.log("Đã đổi PIN.")
+            messagebox.showinfo("Xong", "Đã đổi PIN. Cập nhật lại ô PIN ở góc trên cửa sổ.")
+        except Exception as e:
+            messagebox.showerror("Lỗi", str(e))
+            self.log(f"change_pin FAILED: {e}")
+
+    def _ctap2_config(self, pin):
+        dev = get_device()
+        protocol, token = pin_token(dev, pin)
+        return Ctap2Config(Ctap2(dev), protocol, token)
+
+    def on_enable_enterprise(self):
+        pin = self.pin()
+        if not pin:
+            return
+        try:
+            self._ctap2_config(pin).enable_enterprise_attestation()
+            self.log("Đã bật enterprise attestation.")
+            messagebox.showinfo("Xong", "Đã bật enterprise attestation.")
+        except Exception as e:
+            messagebox.showerror("Lỗi", str(e))
+            self.log(f"enable_enterprise_attestation FAILED: {e}")
+
+    def on_toggle_always_uv(self):
+        pin = self.pin()
+        if not pin:
+            return
+        try:
+            self._ctap2_config(pin).toggle_always_uv()
+            self.log("Đã đảo trạng thái Always UV.")
+            messagebox.showinfo("Xong", "Đã đảo trạng thái Always UV (bật/tắt).")
+        except Exception as e:
+            messagebox.showerror("Lỗi", str(e))
+            self.log(f"toggle_always_uv FAILED: {e}")
+
+    def on_set_min_pin_length(self):
+        pin = self.pin()
+        if not pin:
+            return
+        try:
+            length = int(self.min_pin_length_var.get())
+        except ValueError:
+            messagebox.showerror("Lỗi", "Nhập số nguyên cho độ dài PIN tối thiểu.")
+            return
+        try:
+            self._ctap2_config(pin).set_min_pin_length(min_pin_length=length)
+            self.log(f"Đã đặt độ dài PIN tối thiểu = {length}.")
+            messagebox.showinfo("Xong", f"Đã đặt độ dài PIN tối thiểu = {length}.")
+        except Exception as e:
+            messagebox.showerror("Lỗi", str(e))
+            self.log(f"set_min_pin_length FAILED: {e}")
+
+    def on_factory_reset(self):
+        if not messagebox.askyesno(
+            "XÁC NHẬN RESET",
+            "Việc này xoá VĨNH VIỄN toàn bộ passkey, PIN, cấu hình vault trên thiết bị.\n"
+            "KHÔNG THỂ HOÀN TÁC. Bạn có chắc chắn muốn tiếp tục?"
+        ):
+            return
+        try:
+            dev = get_device()
+            Ctap2(dev).reset()
+            self.log("Đã factory reset thiết bị.")
+            messagebox.showinfo("Xong", "Thiết bị đã được reset về mặc định.")
+        except Exception as e:
+            messagebox.showerror("Lỗi", str(e))
+            self.log(f"reset FAILED: {e}")
 
     # ---- Credentials tab ---------------------------------------------
 
